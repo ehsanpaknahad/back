@@ -366,4 +366,258 @@ router.post("/api/query-with-extent", auth, async (req, res) => {
   }
 });
 
+// ============================================================
+// UPDATE ATTRIBUTES
+// ============================================================
+
+const quoteIdentifier = (identifier) => {
+  return `"${identifier.replace(/"/g, '""')}"`;
+};
+
+const FORBIDDEN_ATTRIBUTE_FIELDS = new Set([
+  "id",
+  "username",
+  "geom",
+  "geometry",
+  "coordinates",
+  "geometryType",
+]);
+
+router.post("/api/update-attributes", auth, async (req, res) => {
+  const { layerName, id, attributes } = req.body;
+
+  try {
+    // ----------------------------------------------------------
+    // 1. Validate request
+    // ----------------------------------------------------------
+
+    if (!layerName || typeof layerName !== "string") {
+      return res.status(400).json({
+        message: "layerName is required",
+      });
+    }
+
+    if (id === undefined || id === null) {
+      return res.status(400).json({
+        message: "id is required",
+      });
+    }
+
+    if (
+      !attributes ||
+      typeof attributes !== "object" ||
+      Array.isArray(attributes)
+    ) {
+      return res.status(400).json({
+        message: "attributes must be an object",
+      });
+    }
+
+    const requestedFields = Object.keys(attributes);
+
+    if (requestedFields.length === 0) {
+      return res.status(400).json({
+        message: "No attributes to update",
+      });
+    }
+
+    // ----------------------------------------------------------
+    // 2. Get layer information
+    // ----------------------------------------------------------
+
+    const layerResult = await pool.query(
+      `
+        SELECT
+          schema_name,
+          layer_name
+        FROM public.layers_list
+        WHERE layer_name = $1
+        LIMIT 1
+      `,
+      [layerName],
+    );
+
+    if (layerResult.rows.length === 0) {
+      return res.status(404).json({
+        message: "Layer not found",
+      });
+    }
+
+    const layer = layerResult.rows[0];
+
+    const schema = layer.schema_name;
+    const table = layer.layer_name;
+
+    // Extra protection for database identifiers
+    const identifierRegex = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+    if (!identifierRegex.test(schema) || !identifierRegex.test(table)) {
+      return res.status(400).json({
+        message: "Invalid layer configuration",
+      });
+    }
+
+    // ----------------------------------------------------------
+    // 3. Get actual columns from PostgreSQL
+    // ----------------------------------------------------------
+
+    const columnsResult = await pool.query(
+      `
+        SELECT
+          column_name,
+          data_type,
+          udt_name,
+          is_nullable,
+          column_default,
+          is_generated
+        FROM information_schema.columns
+        WHERE table_schema = $1
+          AND table_name = $2
+      `,
+      [schema, table],
+    );
+
+    const columns = new Map();
+
+    columnsResult.rows.forEach((column) => {
+      columns.set(column.column_name, column);
+    });
+
+    // ----------------------------------------------------------
+    // 4. Validate requested fields
+    // ----------------------------------------------------------
+
+    for (const field of requestedFields) {
+      // Never allow these fields to be edited
+      if (FORBIDDEN_ATTRIBUTE_FIELDS.has(field)) {
+        return res.status(400).json({
+          message: `Field "${field}" cannot be edited`,
+        });
+      }
+
+      // Field must exist in the database
+      if (!columns.has(field)) {
+        return res.status(400).json({
+          message: `Field "${field}" does not exist in layer "${table}"`,
+        });
+      }
+
+      const column = columns.get(field);
+
+      // Generated fields cannot be manually updated
+      if (column.is_generated === "ALWAYS") {
+        return res.status(400).json({
+          message: `Field "${field}" is a generated field and cannot be edited`,
+        });
+      }
+    }
+
+    // ----------------------------------------------------------
+    // 5. Build UPDATE statement
+    // ----------------------------------------------------------
+
+    const setClauses = [];
+    const values = [];
+
+    requestedFields.forEach((field, index) => {
+      setClauses.push(`${quoteIdentifier(field)} = $${index + 1}`);
+
+      values.push(attributes[field]);
+    });
+
+    // id is the final parameter
+    const idParameterNumber = values.length + 1;
+
+    values.push(id);
+
+    const sql = `
+      UPDATE ${quoteIdentifier(schema)}.${quoteIdentifier(table)}
+      SET ${setClauses.join(", ")}
+      WHERE ${quoteIdentifier("id")} = $${idParameterNumber}
+      RETURNING
+        ${quoteIdentifier("id")},
+        ${requestedFields.map((field) => quoteIdentifier(field)).join(", ")}
+    `;
+
+    // ----------------------------------------------------------
+    // 6. Execute update
+    // ----------------------------------------------------------
+
+    const result = await pool.query(sql, values);
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({
+        message: "Feature not found",
+      });
+    }
+
+    // ----------------------------------------------------------
+    // 7. Return updated attributes
+    // ----------------------------------------------------------
+
+    const updatedFeature = result.rows[0];
+
+    const updatedAttributes = {};
+
+    requestedFields.forEach((field) => {
+      updatedAttributes[field] = updatedFeature[field];
+    });
+
+    res.json({
+      message: "Attributes updated successfully",
+      id: updatedFeature.id,
+      attributes: updatedAttributes,
+    });
+  } catch (error) {
+    console.error("Update attributes error:", error);
+
+    // PostgreSQL data/type errors
+    if (
+      error.code === "22P02" ||
+      error.code === "22007" ||
+      error.code === "22003" ||
+      error.code === "23502"
+    ) {
+      return res.status(400).json({
+        message: "Invalid attribute value",
+        error: error.message,
+      });
+    }
+
+    res.status(500).json({
+      message: "Failed to update attributes",
+      error: error.message,
+    });
+  }
+});
+
+router.get("/api/field-definitions/:layerName", auth, async (req, res) => {
+  const { layerName } = req.params;
+
+  try {
+    const schema = layerName.substring(0, 3).toLowerCase();
+
+    const sql = `
+      SELECT
+        column_name,
+        data_type,
+        is_nullable
+      FROM information_schema.columns
+      WHERE table_schema = $1
+        AND table_name = $2
+      ORDER BY ordinal_position;
+    `;
+
+    const result = await pool.query(sql, [schema, layerName]);
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Failed to load field definitions:", error);
+
+    res.status(500).json({
+      message: "Failed to load field definitions",
+    });
+  }
+});
+
 module.exports = router;
