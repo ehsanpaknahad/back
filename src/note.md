@@ -3,3 +3,14 @@ i use this to run db in my mac : /Users/ehsan/Public/webgis-app/mongodb/bin/mong
 pipe lines should have these necessary filed :"Size", location_type,
 
 if u run it at the office windows pc :  C:\Users\sint097\mongodb\bin\mongod.exe --dbpath="C:\Users\sint097\mongodb-data"
+
+
+consider :
+const FORBIDDEN_ATTRIBUTE_FIELDS = new Set([
+  "id",
+  "username",
+  "geom",
+  "geometry",
+  "coordinates",
+  "geometryType",
+]);
